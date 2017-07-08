@@ -1,0 +1,265 @@
+#define DEBUG_MODE
+#define X_INCLUDE_IO
+
+#include "xdmlab"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#define _USE_MATH_DEFINES
+#include <cmath>
+
+
+
+#ifdef DEBUG_MODE
+	#define __DBG__ 
+#else
+	#define __DBG__ //
+#endif
+
+
+using namespace X;
+using namespace std;
+
+
+typedef float T;
+const xsize xpts = 256;
+const xsize ypts = 256;
+const T Lx = 600000.0f;
+const T Ly = 600000.0f;
+const T nu = 0.1;
+T dx, dy;
+
+
+typedef DataIndex2<T,xpts,ypts> ModelData;
+typedef Enumerator2<xpts, ypts> EnuData;
+
+typedef DataIndex1<T,xpts> GridX;
+typedef DataIndex1<T,ypts> GridY;
+
+
+GridX x;
+GridY y;
+ModelData psi, vort, vort_tmp, vort_tmp2, k1, k2, k3, k4, u, v, tmp, gradx_vort, grady_vort, lap_vort, bc_filter;
+
+const xsize step = 1000;
+const float dt = 3;
+const xsize max_iter = 5000;
+const T max_err = 0.001;
+
+void init();
+void gradx(ModelData&, ModelData&, T);
+void grady(ModelData&, ModelData&, T);
+int jacobi_relaxation(ModelData&, ModelData&, ModelData&, T, T, T, xsize);
+void lap(ModelData&, ModelData&, T, T);
+int output_data(ModelData&, const char *);
+
+
+void init() {
+	X::Util::dLinspace1(x,0.0f,Lx);
+	X::Util::dLinspace1(y,0.0f,Ly);
+	cout << "copy?" <<endl;
+	psi = 0.0f;
+	vort = 0.0f;
+	cout << "copy!" <<endl;
+	dx = x(1) - x(0);
+	dy = y(1) - y(0);
+
+	// create a sin(2 pi x/L) * sin(4 pi y / L) field
+	T rr;
+	EnuData::each_index([&](xsize i, xsize j){
+		
+		vort(i,j) = sin(x(i) / Lx * 2*M_PI) * sin(y(j) / Ly * 4*M_PI) * 0.0005;
+		bc_filter(i,j) = ( i == 0 || j ==0 || i == xpts-1 || j == ypts-1 ) ? 0.0f : 1.0f;
+	});
+
+
+}
+
+void gradx(ModelData& input, ModelData& output, T dx) {
+	T d2x = 2*dx;
+	for(xsize i=0; i<xpts; ++i) {
+		for(xsize j=0; j<ypts; ++j) {
+			if(i == 0) {
+				output(i,j) = (input(i+1,j) - input(i,j)) / dx;
+			} else if(i == xpts-1) {
+				output(i,j) = (input(i,j) - input(i-1,j)) / dx;
+			} else {
+				output(i,j) = (input(i+1, j) - input(i-1,j)) / d2x;
+			}
+		}
+	}
+}
+
+void grady(ModelData& input, ModelData& output, T dy) {
+	T d2y = 2*dy;
+	for(xsize i=0; i<xpts; ++i) {
+		for(xsize j=0; j<ypts; ++j) {
+			if(j == 0) {
+				output(i,j) = (input(i,j+1) - input(i,j)) / dy;
+			} else if(j == ypts-1) {
+				output(i,j) = (input(i,j) - input(i,j-1)) / dy;
+			} else {
+				output(i,j) = (input(i, j+1) - input(i,j-1)) / d2y;
+			}
+		}
+	}
+}
+
+
+int jacobi_relaxation(ModelData& input, ModelData& output, ModelData& tmp, T dx, T dy, T max_err, xsize max_iter) {
+	/*
+	 * The input cannot be protected from damaging.
+	 * Boundary condition is specify on the margin of input
+	 */
+	T err = 0, r;
+	T gamma = 1 / (2 * ( 1/(dx*dx) + 1/(dy*dy) ) );
+
+//	cout << &output << endl;
+	
+	output.copyData(input);
+//	cout << "original: 1. getTargetDataPointer " 	<< output.getTargetDataPointer() << "," << input.getTargetDataPointer() << \
+		 "2. p " << output.p() << "," << input.p() << endl;
+//	output = input;
+//	cout << "modified: 1. getTargetDataPointer " 	<< output.getTargetDataPointer() << "," << input.getTargetDataPointer() << \
+		 "2. p " << output.p() << "," << input.p() << endl;
+	//output.copyData(input);
+	//cout << "modified: " << &(output.getData(0)) << "," << &(input.getData(0)) << endl;
+		 
+	for(xsize iter = 0; iter < max_iter; ++iter) {
+		
+		err = 0;
+		// calculate nth step zeta field
+		lap(output, tmp, dx, dy);
+
+		// tune
+		for(xsize i = 1; i < xpts-1; ++i) {
+			for(xsize j = 1; j < ypts-1; ++j) {
+				r = tmp(i,j) - input(i,j);
+				err += r * r;
+				output(i,j) += gamma * r;
+			}
+		}
+		err /= ((xpts-2)*(ypts-2));
+		fprintf(stderr,"[%d] Err avg: %5f\n",iter, err);
+
+		if(err < max_err)
+			return 0;
+	}
+	
+	return -1;
+}
+
+void lap(ModelData& input, ModelData& output, T dx, T dy) {
+	/*
+	 * Points must be larger than 3 in each direction.
+	 */
+
+	T dxdx = dx * dx;
+	T dydy = dy * dy;
+	xsize centx, centy;
+	for(xsize i = 0; i < xpts; ++i) {
+		for(xsize j = 0; j < ypts; ++j) {
+			centx = i; centy = j;
+			if(i == 0)
+				++centx;
+			else if(i == xpts-1)
+				--centx;
+
+			if(j == 0)
+				++centy;
+			else if(j == ypts-1)
+				--centy;
+
+			output(i,j) = (input(centx+1,centy) + input(centx-1,centy) - 2*input(centx,centy)) / dxdx \
+						  +  (input(centx,centy+1) + input(centx,centy-1) - 2*input(centx,centy)) / dydy;
+		}
+	}
+
+}
+
+int output_data(ModelData& dat, const char * filename) {
+	FILE * file = fopen(filename,"wb");
+	fwrite(dat.p(), sizeof(T), xpts*ypts, file);
+	fclose(file);
+	return 0;
+}
+
+int main() {
+
+	init();
+
+	int err;
+
+	auto evolution = [&] (ModelData& k, ModelData& evo_vort) {
+		vort_tmp2.copyData(evo_vort);
+		EnuData::each_index([&](xsize i, xsize j) {
+			vort_tmp2(i,j) *= bc_filter(i,j);
+		});
+
+		// inverse vort to psi
+		if((err = jacobi_relaxation(vort_tmp2, psi, tmp, dx, dy, max_err, max_iter)) != 0) {
+			fprintf(stderr, "[Error code %d]: Relaxation cannot converge within [%d] iterations.\n", err, max_iter);
+			return -1;
+		}
+
+		// calculate u,v
+		grady(psi, u, dy); u *= -1.0f;
+		gradx(psi, v, dx);
+
+		// calculate grad vort
+		gradx(evo_vort, gradx_vort, dx);
+		grady(evo_vort, grady_vort, dy);
+
+		// calculate lap vort
+		lap(evo_vort, lap_vort, dx, dy);
+		
+		EnuData::each_index([&](xsize i, xsize j){
+			k(i,j) = -u(i,j) * gradx_vort(i,j) - v(i,j) * grady_vort(i,j) + nu * lap_vort(i,j);	
+		});
+	
+	};
+
+	auto calculator = [&] (ModelData& output, ModelData& input, ModelData& k, T dt) {
+		EnuData:: each_index([&](xsize i, xsize j) {
+			output(i,j) = input(i,j) + k(i,j) * dt;		
+		});
+	};
+
+	for(xsize i = 0; i < step; ++i) {
+		cout << "step:" << i << endl;
+		evolution(k1, vort); 	 calculator(vort_tmp, vort, k1, 0.5 * dt);
+		evolution(k2, vort_tmp); calculator(vort_tmp, vort, k2, 0.5 * dt);
+		evolution(k3, vort_tmp); calculator(vort_tmp, vort, k3, dt);
+		evolution(k4, vort_tmp);
+
+		EnuData::each_index([&](xsize i, xsize j){
+			vort(i,j) +=  dt / 6.0 * (k1(i,j) + 2*k2(i,j) + 2*k3(i,j) + k4(i,j));
+		});
+
+
+		if(i % 10 == 0) {
+			stringstream filename;
+			filename << "vort_" << i << ".bin";
+			output_data(vort, filename.str().c_str());
+		}
+		// calculate new vort
+	}
+//	cout << "start" << endl;
+//	cout << "Jacobi Result: " << jacobi_relaxation(vort, psi, tmp, dx, dy, max_err, max_iter) << endl;
+	//lap(psi,vort,dx,dy);
+
+//	psi = vort;
+
+//	cout << &(psi.getData(0)) << " compare " << (psi.getDataPointer()) << endl;
+
+//	cout << "Seg?" <<endl;
+//	psi(0,0) += 200;
+
+
+//	output_data(vort, "init_vort.bin");
+//	output_data(psi, "init_psi.bin");
+
+	return 0;
+}
+
+
